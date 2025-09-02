@@ -1,0 +1,199 @@
+import random
+import optuna
+import torch
+import numpy as np
+import logging
+import logging.handlers
+import multiprocessing
+from stable_baselines3 import PPO
+from stable_baselines3.common.env_util import make_vec_env
+from trading_envs import long_only_stock_env
+
+
+def set_seeds(seed_value=42):
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+    torch.cuda.manual_seed(seed_value)
+    torch.cuda.manual_seed_all(seed_value)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def get_best_args(study_name, storage_name):
+    study = optuna.load_study(study_name, storage_name)
+    best_trial = study.best_trial
+    best_args = best_trial.params
+    return best_args
+
+def listener_configurer():
+    """Configures the listener's root logger."""
+    root = logging.getLogger()
+    h = logging.StreamHandler()
+    f = logging.Formatter('%(asctime)s %(processName)-10s %(levelname)-8s %(message)s')
+    h.setFormatter(f)
+    root.addHandler(h)
+    root.setLevel(logging.INFO)
+
+def log_listener_process(queue, configurer):
+    """
+    Listens for log records on a queue and processes them.
+    This runs in a separate process.
+    """
+    configurer()
+    logger = logging.getLogger()
+    logger.info("Log listener started.")
+    while True:
+        try:
+            record = queue.get()
+            if record is None:  # We send this as a sentinel to tell it to quit.
+                logger.info("Log listener shutting down.")
+                break
+            logger.handle(record)
+        except Exception:
+            import sys, traceback
+            print('Problem in log listener:', file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+
+def worker_configurer(queue):
+    """Configures logging for a worker process to send to the queue."""
+    h = logging.handlers.QueueHandler(queue)
+    root = logging.getLogger()
+    root.addHandler(h)
+    root.setLevel(logging.INFO)
+
+def run_worker(log_queue, study_name, storage_name, feature_cols, train_df, validation_df, policy_kwargs):
+    """Initializes and runs a tuner instance, now with logging config."""
+    from tuners import base_parameters_tuner
+
+    worker_configurer(log_queue)
+    tuner = base_parameters_tuner.IterativeTuner(study_name, storage_name, feature_cols, train_df, validation_df, policy_kwargs)
+    tuner.run_iteratively()
+
+def run_parallel_tuning(study_name, storage_name, num_workers, feature_cols, train_df, validation_df, policy_kwargs):
+    print("--- Starting Hyperparameter Tuning with Multiple Workers ---")
+    print(f"Study Name: {study_name}")
+    print(f"Database: {storage_name}")
+    print(f"Launching {num_workers} non-blocking workers...")
+
+    log_queue = multiprocessing.Queue(-1)
+    listener = multiprocessing.Process(
+        target=log_listener_process,
+        args=(log_queue, listener_configurer)
+    )
+    listener.start()
+
+    worker_configurer(log_queue)
+    main_logger = logging.getLogger()
+    main_logger.info("--- Starting Hyperparameter Tuning with Live Logging ---")
+
+    processes = []
+
+    # run_worker(log_queue, STUDY_NAME, STORAGE_NAME)
+    processes = []
+    for i in range(num_workers):
+        p = multiprocessing.Process(
+            target=run_worker,
+            args=(log_queue, study_name, storage_name, feature_cols, train_df, validation_df, policy_kwargs),
+            name=f"Worker-{i+1}"
+        )
+        processes.append(p)
+        p.start()
+        main_logger.info(f"Process {p.name} started.")
+
+    # --- Wait for workers to finish ---
+    for p in processes:
+        p.join()
+
+    # --- Cleanly shut down the listener ---
+    main_logger.info("--- All workers finished. Shutting down log listener. ---")
+    log_queue.put_nowait(None) # Send the sentinel to stop the listener
+    listener.join()
+    main_logger.info("--- Script finished. ---")
+
+def train_model(train_df, test_df, feature_cols, policy_kwargs, best_args):
+
+    device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+    def make_env():
+        env = long_only_stock_env.StockTradingEnv(train_df, feature_cols, window_size=10)
+        return env
+
+    vec_env = make_vec_env(make_env, n_envs=4, seed=42)
+
+
+    model = PPO(
+        "CnnPolicy",
+        vec_env,
+        policy_kwargs=policy_kwargs, # Use the custom policy kwargs
+        n_steps=best_args['n_steps'],
+        # batch_size=64,
+        gamma=best_args['gamma'],
+        learning_rate=best_args['learning_rate'],
+        ent_coef=best_args['ent_coef'],
+        verbose=1,
+        device=device,
+        seed=42
+    )
+
+
+    print("\n--- Starting Model Training ---")
+    model.learn(total_timesteps=10000)
+    print("--- Model Training Finished ---")
+
+    # --- Backtesting ---
+    backtest_env = long_only_stock_env.StockTradingEnv(test_df, feature_cols, window_size=10)
+    obs, info = backtest_env.reset(seed=42)
+
+    # Store net worth at each step for plotting
+    agent_net_worth = [backtest_env.initial_balance]
+    buy_hold_net_worth = [backtest_env.initial_balance]
+
+    initial_price = test_df['original_close'].iloc[0]
+    initial_shares = backtest_env.initial_balance // initial_price
+
+    print("\n--- Starting Backtesting ---")
+    while True:
+        action, _ = model.predict(obs, deterministic=True)
+        obs, reward, terminated, truncated, info = backtest_env.step(action)
+
+        # Update net worth lists
+        agent_net_worth.append(info['net_worth'])
+        current_price = test_df['original_close'].iloc[backtest_env.current_step]
+        buy_hold_net_worth.append(initial_shares * current_price + (backtest_env.initial_balance % initial_price))
+
+
+        if terminated or truncated:
+            break
+
+    print(model.predict(obs, deterministic=True))
+
+    # --- Results ---
+    final_net_worth = info['net_worth']
+    initial_net_worth = backtest_env.initial_balance
+    profit = final_net_worth - initial_net_worth
+    buy_hold_profit = (test_df['original_close'].iloc[-1] - test_df['original_close'].iloc[0]) * initial_shares
+
+    print("\n--- Backtesting Finished ---")
+    print("--------------------------------")
+    print(f"Final Net Worth: ${final_net_worth:,.2f}")
+    print(f"Agent's Profit: ${profit:,.2f}")
+    print(f"Buy and Hold Profit: ${buy_hold_profit:,.2f}")
+    print("--------------------------------")
+
+    if profit > buy_hold_profit:
+        print("✅ Agent outperformed Buy and Hold.")
+    else:
+        print("❌ Agent did not outperform Buy and Hold.")
+
+    # --- Visualization ---
+    import matplotlib.pyplot as plt
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(agent_net_worth, label='Agent Net Worth')
+    plt.plot(buy_hold_net_worth, label='Buy and Hold Net Worth')
+    plt.title('Agent vs Buy and Hold Performance During Backtesting')
+    plt.xlabel('Time Steps')
+    plt.ylabel('Net Worth ($)')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
