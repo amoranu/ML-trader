@@ -9,12 +9,12 @@ class StockTradingEnv(gym.Env):
     delay between observation and action execution.
     """
 
-    def __init__(self, df, features, window_size=10):
+    def __init__(self, df, features, window_size=10, initial_balance=10000):
         super(StockTradingEnv, self).__init__()
 
         self.df = df
         self.window_size = window_size
-        self.initial_balance = 10000
+        self.initial_balance = initial_balance
 
         self.feature_cols = features
         self.action_space = spaces.Discrete(4)
@@ -45,13 +45,8 @@ class StockTradingEnv(gym.Env):
 
 
     def step(self, action):
-        # The action is based on the observation from the PREVIOUS step.
-        # We execute this action using the price data from the CURRENT step.
-
-        # --- NEW: Move to the next day to get the execution price ---
         self.current_step += 1
 
-        # If we've reached the end of the dataset, we can't execute a trade.
         if self.current_step >= len(self.df):
             terminated = True
             reward = 0
@@ -59,9 +54,7 @@ class StockTradingEnv(gym.Env):
             info = {'net_worth': self.net_worth}
             return obs, reward, terminated, False, info
 
-        # --- The rest of the logic uses the now-current step's price ---
         previous_net_worth = self.net_worth
-        # Use the closing price for execution, close at day end.
         current_price = self.df['original_close'].iloc[self.current_step]
 
         if action == 0: # Sell 50%

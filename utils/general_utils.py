@@ -88,8 +88,6 @@ def run_parallel_tuning(study_name, storage_name, num_workers, feature_cols, tra
 
     processes = []
 
-    # run_worker(log_queue, STUDY_NAME, STORAGE_NAME)
-    processes = []
     for i in range(num_workers):
         p = multiprocessing.Process(
             target=run_worker,
@@ -100,22 +98,20 @@ def run_parallel_tuning(study_name, storage_name, num_workers, feature_cols, tra
         p.start()
         main_logger.info(f"Process {p.name} started.")
 
-    # --- Wait for workers to finish ---
     for p in processes:
         p.join()
 
-    # --- Cleanly shut down the listener ---
     main_logger.info("--- All workers finished. Shutting down log listener. ---")
-    log_queue.put_nowait(None) # Send the sentinel to stop the listener
+    log_queue.put_nowait(None) 
     listener.join()
     main_logger.info("--- Script finished. ---")
 
-def train_model(train_df, test_df, feature_cols, policy_kwargs, best_args):
+def train_model(train_df, test_df, feature_cols, policy_kwargs, best_args, initial_balance=10000):
 
     device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     def make_env():
-        env = long_only_stock_env.StockTradingEnv(train_df, feature_cols, window_size=10)
+        env = long_only_stock_env.StockTradingEnv(train_df, feature_cols, window_size=10, initial_balance=initial_balance)
         return env
 
     vec_env = make_vec_env(make_env, n_envs=4, seed=42)
@@ -124,9 +120,8 @@ def train_model(train_df, test_df, feature_cols, policy_kwargs, best_args):
     model = PPO(
         "CnnPolicy",
         vec_env,
-        policy_kwargs=policy_kwargs, # Use the custom policy kwargs
+        policy_kwargs=policy_kwargs,
         n_steps=best_args['n_steps'],
-        # batch_size=64,
         gamma=best_args['gamma'],
         learning_rate=best_args['learning_rate'],
         ent_coef=best_args['ent_coef'],
@@ -140,11 +135,9 @@ def train_model(train_df, test_df, feature_cols, policy_kwargs, best_args):
     model.learn(total_timesteps=10000)
     print("--- Model Training Finished ---")
 
-    # --- Backtesting ---
-    backtest_env = long_only_stock_env.StockTradingEnv(test_df, feature_cols, window_size=10)
+    backtest_env = long_only_stock_env.StockTradingEnv(test_df, feature_cols, window_size=10, initial_balance=initial_balance)
     obs, info = backtest_env.reset(seed=42)
 
-    # Store net worth at each step for plotting
     agent_net_worth = [backtest_env.initial_balance]
     buy_hold_net_worth = [backtest_env.initial_balance]
 
@@ -156,7 +149,6 @@ def train_model(train_df, test_df, feature_cols, policy_kwargs, best_args):
         action, _ = model.predict(obs, deterministic=True)
         obs, reward, terminated, truncated, info = backtest_env.step(action)
 
-        # Update net worth lists
         agent_net_worth.append(info['net_worth'])
         current_price = test_df['original_close'].iloc[backtest_env.current_step]
         buy_hold_net_worth.append(initial_shares * current_price + (backtest_env.initial_balance % initial_price))
@@ -165,12 +157,8 @@ def train_model(train_df, test_df, feature_cols, policy_kwargs, best_args):
         if terminated or truncated:
             break
 
-    print(model.predict(obs, deterministic=True))
-
-    # --- Results ---
     final_net_worth = info['net_worth']
-    initial_net_worth = backtest_env.initial_balance
-    profit = final_net_worth - initial_net_worth
+    profit = final_net_worth - initial_balance
     buy_hold_profit = (test_df['original_close'].iloc[-1] - test_df['original_close'].iloc[0]) * initial_shares
 
     print("\n--- Backtesting Finished ---")
@@ -184,16 +172,5 @@ def train_model(train_df, test_df, feature_cols, policy_kwargs, best_args):
         print("✅ Agent outperformed Buy and Hold.")
     else:
         print("❌ Agent did not outperform Buy and Hold.")
-
-    # --- Visualization ---
-    import matplotlib.pyplot as plt
-
-    plt.figure(figsize=(12, 6))
-    plt.plot(agent_net_worth, label='Agent Net Worth')
-    plt.plot(buy_hold_net_worth, label='Buy and Hold Net Worth')
-    plt.title('Agent vs Buy and Hold Performance During Backtesting')
-    plt.xlabel('Time Steps')
-    plt.ylabel('Net Worth ($)')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+        
+    return agent_net_worth, buy_hold_net_worth
