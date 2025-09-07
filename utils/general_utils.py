@@ -7,7 +7,7 @@ import logging.handlers
 import multiprocessing
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
-from trading_envs import long_only_stock_env
+from trading_envs import long_only_stock_env, verification_env
 
 
 def set_seeds(seed_value=42):
@@ -63,10 +63,10 @@ def worker_configurer(queue):
 
 def run_worker(log_queue, study_name, storage_name, feature_cols, train_df, validation_df, policy_kwargs):
     """Initializes and runs a tuner instance, now with logging config."""
-    from tuners import base_parameters_tuner
+    from tuners import base_parameters_tuner, verification
 
     worker_configurer(log_queue)
-    tuner = base_parameters_tuner.IterativeTuner(study_name, storage_name, feature_cols, train_df, validation_df, policy_kwargs)
+    tuner = verification.IterativeTuner(study_name, storage_name, feature_cols, train_df, validation_df, policy_kwargs)
     tuner.run_iteratively()
 
 def run_parallel_tuning(study_name, storage_name, num_workers, feature_cols, train_df, validation_df, policy_kwargs):
@@ -136,6 +136,75 @@ def train_model(train_df, test_df, feature_cols, policy_kwargs, best_args, initi
     print("--- Model Training Finished ---")
 
     backtest_env = long_only_stock_env.StockTradingEnv(test_df, feature_cols, window_size=10, initial_balance=initial_balance)
+    obs, info = backtest_env.reset(seed=42)
+
+    agent_net_worth = [backtest_env.initial_balance]
+    buy_hold_net_worth = [backtest_env.initial_balance]
+
+    initial_price = test_df['original_close'].iloc[0]
+    initial_shares = backtest_env.initial_balance // initial_price
+
+    print("\n--- Starting Backtesting ---")
+    while True:
+        action, _ = model.predict(obs, deterministic=True)
+        obs, reward, terminated, truncated, info = backtest_env.step(action)
+
+        agent_net_worth.append(info['net_worth'])
+        current_price = test_df['original_close'].iloc[backtest_env.current_step]
+        buy_hold_net_worth.append(initial_shares * current_price + (backtest_env.initial_balance % initial_price))
+
+
+        if terminated or truncated:
+            break
+
+    final_net_worth = info['net_worth']
+    profit = final_net_worth - initial_balance
+    buy_hold_profit = (test_df['original_close'].iloc[-1] - test_df['original_close'].iloc[0]) * initial_shares
+
+    print("\n--- Backtesting Finished ---")
+    print("--------------------------------")
+    print(f"Final Net Worth: ${final_net_worth:,.2f}")
+    print(f"Agent's Profit: ${profit:,.2f}")
+    print(f"Buy and Hold Profit: ${buy_hold_profit:,.2f}")
+    print("--------------------------------")
+
+    if profit > buy_hold_profit:
+        print("✅ Agent outperformed Buy and Hold.")
+    else:
+        print("❌ Agent did not outperform Buy and Hold.")
+        
+    return agent_net_worth, buy_hold_net_worth
+
+def train_model_verification(train_df, test_df, feature_cols, policy_kwargs, best_args, initial_balance=10000):
+
+    device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+    def make_env():
+        env = verification_env.StockTradingEnv(train_df, feature_cols, window_size=10, initial_balance=initial_balance, stop_out_threshold=best_args['stop_out_threshold'], holding_penalty_rate=best_args['holding_penalty_rate'], stop_out_penalty=best_args['stop_out_penalty'])
+        return env
+
+    vec_env = make_vec_env(make_env, n_envs=4, seed=42)
+
+
+    model = PPO(
+        "CnnPolicy",
+        vec_env,
+        policy_kwargs=policy_kwargs,
+        n_steps=best_args['n_steps'],
+        gamma=best_args['gamma'],
+        learning_rate=best_args['learning_rate'],
+        ent_coef=best_args['ent_coef'],
+        verbose=1,
+        device=device,
+        seed=42
+    )
+
+
+    print("\n--- Starting Model Training ---")
+    model.learn(total_timesteps=10000)
+    print("--- Model Training Finished ---")
+
+    backtest_env = verification_env.StockTradingEnv(test_df, feature_cols, window_size=10, initial_balance=initial_balance, stop_out_threshold=best_args['stop_out_threshold'], holding_penalty_rate=best_args['holding_penalty_rate'], stop_out_penalty=best_args['stop_out_penalty'])
     obs, info = backtest_env.reset(seed=42)
 
     agent_net_worth = [backtest_env.initial_balance]

@@ -12,6 +12,7 @@ class PortfolioTrader:
         self.starting_balance = starting_balance
         self.balance_per_ticker = starting_balance / len(tickers)
         self.portfolio_net_worth = None
+        self.is_verification = True
 
     def run(self):
         all_net_worths = {}
@@ -28,16 +29,16 @@ class PortfolioTrader:
                 features_extractor_kwargs=dict(features_dim=128),
             )
             
-            study_name = f"parallel_iterative_study_{ticker}"
+            study_name = f"verification_study_{ticker}" if self.is_verification else f"parallel_iterative_study_{ticker}"
             db_file_path = os.path.join("db", f"{study_name}.db")
             storage_name = f"sqlite:///{db_file_path}"
             num_workers = 4
 
-            general_utils.run_parallel_tuning(study_name, storage_name, num_workers, feature_cols, train_df, validation_df, policy_kwargs)
+            # general_utils.run_parallel_tuning(study_name, storage_name, num_workers, feature_cols, train_df, validation_df, policy_kwargs)
             best_args = general_utils.get_best_args(study_name, storage_name)
             
             # 3. Backtesting
-            agent_net_worth, buy_hold_net_worth = general_utils.train_model(train_df, test_df, feature_cols, policy_kwargs, best_args, self.balance_per_ticker)
+            agent_net_worth, buy_hold_net_worth = general_utils.train_model_verification(train_df, test_df, feature_cols, policy_kwargs, best_args, self.balance_per_ticker)
             
             all_net_worths[ticker] = {
                 'agent': agent_net_worth,
@@ -133,7 +134,7 @@ class PortfolioTrader:
         plt.show()
 
 def main():
-    tickers = ['AAPL', 'TSLA', 'AMZN', 'VTI']
+    tickers = ['AAPL']#, 'TSLA', 'AMZN', 'VTI']
     starting_balance = 100000
     general_utils.set_seeds()
     

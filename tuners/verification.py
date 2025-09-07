@@ -33,21 +33,27 @@ class IterativeTuner:
     def objective(self, trial: optuna.trial.Trial) -> float:
         """The Optuna objective function, now a method of the class."""
         # ----------------- ADDED LOCAL IMPORT HERE -----------------
-        from trading_envs import long_only_stock_env
+        from trading_envs import verification_env
 
         learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
-        n_steps = trial.suggest_categorical("n_steps", [1024, 2048, 4096])
+        n_steps = trial.suggest_categorical("n_steps", [512, 1024, 2048, 4096])
         gamma = trial.suggest_float("gamma", 0.9, 0.9999)
         ent_coef = trial.suggest_float("ent_coef", 1e-8, 1e-1, log=True)
 
+        # --- Suggest StockTradingEnv hyperparameters ---
+        window_size = trial.suggest_int("window_size", 5, 20) # Example range, adjust as needed
+        stop_out_threshold = trial.suggest_float("stop_out_threshold", 0.1, 0.5) # Example range, adjust as needed
+        holding_penalty_rate = trial.suggest_float("holding_penalty_rate", 0.001, 0.01) # Example range, adjust as needed
+        stop_out_penalty = trial.suggest_float("stop_out_penalty", 100, 1000) # Example range, adjust as needed
+
         # Assuming dummy variables for demonstration
-        TRIAL_TIMESTEPS = 10000 
-        window_size = 10
+        TRIAL_TIMESTEPS = 10000 # Reduced for faster example execution
         n_envs = 4
+
 
         # The core logic remains the same
         def make_env():
-            return long_only_stock_env.StockTradingEnv(self.train_df, self.feature_cols, window_size=window_size)
+            return verification_env.StockTradingEnv(self.train_df, self.feature_cols, window_size=window_size, stop_out_threshold=stop_out_threshold, holding_penalty_rate=holding_penalty_rate, stop_out_penalty=stop_out_penalty)
         vec_env = make_vec_env(make_env, n_envs=n_envs, seed=42)
 
         model = PPO(
@@ -56,7 +62,7 @@ class IterativeTuner:
         )
         model.learn(total_timesteps=TRIAL_TIMESTEPS)
 
-        eval_env = long_only_stock_env.StockTradingEnv(self.validation_df, self.feature_cols, window_size=window_size)
+        eval_env = verification_env.StockTradingEnv(self.validation_df, self.feature_cols, window_size=window_size, stop_out_threshold=stop_out_threshold, holding_penalty_rate=holding_penalty_rate, stop_out_penalty=stop_out_penalty)
         obs, info = eval_env.reset(seed=42)
         while True:
             action, _ = model.predict(obs, deterministic=True)
