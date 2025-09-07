@@ -25,7 +25,7 @@ class IterativeTuner:
         # --- Configuration ---
         self.improvement_threshold = 1.10  # 10%
         self.batch_size = 10
-        self.max_total_batches = 4
+        self.max_total_batches = 2
         self.batches=0
 
         self.logger.info(f"Tuner initialized for study '{self.study_name}' on device '{self.device}'")
