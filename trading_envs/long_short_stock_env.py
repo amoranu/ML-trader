@@ -5,13 +5,13 @@ from gymnasium import spaces
 import numpy as np
 import math
 
-class LongShortStockEnv(gym.Env):
+class StockTradingEnv(gym.Env):
     """
     A stock trading environment that allows for both long and short positions.
     """
 
     def __init__(self, df, features, window_size=10, initial_balance=10000):
-        super(LongShortStockEnv, self).__init__()
+        super(StockTradingEnv, self).__init__()
 
         self.df = df
         self.window_size = window_size

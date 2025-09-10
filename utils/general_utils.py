@@ -7,8 +7,6 @@ import logging.handlers
 import multiprocessing
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
-from trading_envs import long_only_stock_env
-
 
 def set_seeds(seed_value=42):
     random.seed(seed_value)
@@ -61,15 +59,15 @@ def worker_configurer(queue):
     root.addHandler(h)
     root.setLevel(logging.INFO)
 
-def run_worker(log_queue, study_name, storage_name, feature_cols, train_df, validation_df, policy_kwargs):
+def run_worker(log_queue, study_name, storage_name, feature_cols, train_df, validation_df, policy_kwargs, env):
     """Initializes and runs a tuner instance, now with logging config."""
     from tuners import base_parameters_tuner
 
     worker_configurer(log_queue)
-    tuner = base_parameters_tuner.IterativeTuner(study_name, storage_name, feature_cols, train_df, validation_df, policy_kwargs)
+    tuner = base_parameters_tuner.IterativeTuner(study_name, storage_name, feature_cols, train_df, validation_df, policy_kwargs, env)
     tuner.run_iteratively()
 
-def run_parallel_tuning(study_name, storage_name, num_workers, feature_cols, train_df, validation_df, policy_kwargs):
+def run_parallel_tuning(study_name, storage_name, num_workers, feature_cols, train_df, validation_df, policy_kwargs, env):
     print("--- Starting Hyperparameter Tuning with Multiple Workers ---")
     print(f"Study Name: {study_name}")
     print(f"Database: {storage_name}")
@@ -91,7 +89,7 @@ def run_parallel_tuning(study_name, storage_name, num_workers, feature_cols, tra
     for i in range(num_workers):
         p = multiprocessing.Process(
             target=run_worker,
-            args=(log_queue, study_name, storage_name, feature_cols, train_df, validation_df, policy_kwargs),
+            args=(log_queue, study_name, storage_name, feature_cols, train_df, validation_df, policy_kwargs, env),
             name=f"Worker-{i+1}"
         )
         processes.append(p)
@@ -106,43 +104,54 @@ def run_parallel_tuning(study_name, storage_name, num_workers, feature_cols, tra
     listener.join()
     main_logger.info("--- Script finished. ---")
 
-def train_model(train_df, test_df, feature_cols, policy_kwargs, best_args, initial_balance=10000):
+def calculate_buy_hold_net_worth(test_df, initial_balance):
+    initial_price = test_df['original_close'].iloc[0]
+    initial_shares = initial_balance // initial_price
+    buy_hold_net_worth = (test_df['original_close'] * initial_shares) + (initial_balance % initial_price)
+    return buy_hold_net_worth
+
+def train_model(train_df, test_df, feature_cols, policy_kwargs, best_args, initial_balance=10000, env_class=None):
 
     device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
+
     def make_env():
-        env = long_only_stock_env.StockTradingEnv(train_df, feature_cols, window_size=10, initial_balance=initial_balance)
-        return env
+        return env_class(train_df, feature_cols, window_size=10, initial_balance=initial_balance)
 
     vec_env = make_vec_env(make_env, n_envs=4, seed=42)
 
+    # If best_args is empty, use some default values.
+    if not best_args:
+        best_args = {
+            'n_steps': 2048,
+            'gamma': 0.99,
+            'learning_rate': 0.0003,
+            'ent_coef': 0.01,
+        }
 
     model = PPO(
-        "CnnPolicy",
+        "MlpPolicy",
         vec_env,
         policy_kwargs=policy_kwargs,
-        n_steps=best_args['n_steps'],
-        gamma=best_args['gamma'],
-        learning_rate=best_args['learning_rate'],
-        ent_coef=best_args['ent_coef'],
+        n_steps=best_args.get('n_steps', 2048),
+        gamma=best_args.get('gamma', 0.99),
+        learning_rate=best_args.get('learning_rate', 0.0003),
+        ent_coef=best_args.get('ent_coef', 0.01),
         verbose=1,
         device=device,
         seed=42
     )
 
-
     print("\n--- Starting Model Training ---")
     model.learn(total_timesteps=10000)
     print("--- Model Training Finished ---")
 
-    backtest_env = long_only_stock_env.StockTradingEnv(test_df, feature_cols, window_size=10, initial_balance=initial_balance)
+    backtest_env = env_class(test_df, feature_cols, window_size=10, initial_balance=initial_balance)
     obs, info = backtest_env.reset(seed=42)
 
     agent_net_worth = [backtest_env.initial_balance]
+    buy_hold_net_worth_series = calculate_buy_hold_net_worth(test_df, backtest_env.initial_balance)
     buy_hold_net_worth = [backtest_env.initial_balance]
-
-    initial_price = test_df['original_close'].iloc[0]
-    initial_shares = backtest_env.initial_balance // initial_price
 
     print("\n--- Starting Backtesting ---")
     while True:
@@ -150,16 +159,18 @@ def train_model(train_df, test_df, feature_cols, policy_kwargs, best_args, initi
         obs, reward, terminated, truncated, info = backtest_env.step(action)
 
         agent_net_worth.append(info['net_worth'])
-        current_price = test_df['original_close'].iloc[backtest_env.current_step]
-        buy_hold_net_worth.append(initial_shares * current_price + (backtest_env.initial_balance % initial_price))
-
+        
+        # Ensure the index is within bounds
+        if backtest_env.current_step < len(buy_hold_net_worth_series):
+            buy_hold_net_worth.append(buy_hold_net_worth_series.iloc[backtest_env.current_step])
 
         if terminated or truncated:
             break
 
     final_net_worth = info['net_worth']
     profit = final_net_worth - initial_balance
-    buy_hold_profit = (test_df['original_close'].iloc[-1] - test_df['original_close'].iloc[0]) * initial_shares
+    buy_hold_final_net_worth = buy_hold_net_worth_series.iloc[-1]
+    buy_hold_profit = buy_hold_final_net_worth - initial_balance
 
     print("\n--- Backtesting Finished ---")
     print("--------------------------------")
