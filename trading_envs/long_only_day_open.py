@@ -55,7 +55,7 @@ class StockTradingEnv(gym.Env):
             return obs, reward, terminated, False, info
 
         previous_net_worth = self.net_worth
-        current_price = self.df['original_close'].iloc[self.current_step]
+        current_price = self.df['Open'].iloc[self.current_step]
 
         if action == 0: # Sell 50%
             shares_to_sell = math.floor(self.shares_held * 0.5)

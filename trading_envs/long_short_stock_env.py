@@ -49,7 +49,7 @@ class StockTradingEnv(gym.Env):
         obs = np.clip(obs, -10, 10)
         return np.expand_dims(obs, axis=0).astype(np.float32)
 
-    def reset(self, seed=None):
+    def reset(self, seed=42):
         super().reset(seed=seed)
         self.balance = self.initial_balance
         self.shares_held = 0

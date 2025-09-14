@@ -3,7 +3,7 @@ from sklearn.preprocessing import StandardScaler
 import pandas as pd
 from utils import general_utils, fetchers, features
 from learners import CustomCNN, CustomLSTM
-from trading_envs import long_only_stock_env, long_short_stock_env
+from trading_envs import long_only_day_open, long_only_stock_env, long_short_stock_env
 import os
 import matplotlib.pyplot as plt
 import argparse
@@ -202,22 +202,25 @@ def compare_strategies(ticker, strategies_to_compare):
 # Define available strategies
 STRATEGIES = {
     'CNN_LongOnly': {'learner': CustomCNN.CustomCNN, 'env': long_only_stock_env.StockTradingEnv},
+    'CNN_LongOnlyOpen': {'learner': CustomCNN.CustomCNN, 'env': long_only_day_open.StockTradingEnv},
     'LSTM_LongOnly': {'learner': CustomLSTM.CustomLSTM, 'env': long_only_stock_env.StockTradingEnv},
+    'LSTM_LongOnlyOpen': {'learner': CustomLSTM.CustomLSTM, 'env': long_only_day_open.StockTradingEnv},
     'CNN_LongShort': {'learner': CustomCNN.CustomCNN, 'env': long_short_stock_env.StockTradingEnv},
     'LSTM_LongShort': {'learner': CustomLSTM.CustomLSTM, 'env': long_short_stock_env.StockTradingEnv},
 }
 
 def main():
+    general_utils.set_seeds(42)
     parser = argparse.ArgumentParser(description='ML Trader.')
     parser.add_argument('--mode', type=str, default='trade', choices=['trade', 'find_best', 'compare'], help='Operation mode.')
-    parser.add_argument('--tickers', nargs='+', default=['AAPL'], help='List of stock tickers.')
-    parser.add_argument('--strategy', type=str, default='CNN_LongOnly', choices=STRATEGIES.keys(), help='Trading strategy to use.')
-    parser.add_argument('--compare_strategies', nargs='+', default=[ 'LSTM_LongOnly','CNN_LongOnly','LSTM_LongShort','CNN_LongShort'], help='List of strategies to compare.')
+    parser.add_argument('--tickers', nargs='+', default=['TSLA'], help='List of stock tickers.')
+    parser.add_argument('--strategy', type=str, default='CNN_LongOnlyOpen', choices=STRATEGIES.keys(), help='Trading strategy to use.')
+    parser.add_argument('--compare_strategies', nargs='+', default=[ 'LSTM_LongOnly','CNN_LongOnly', 'LSTM_LongOnlyOpen','CNN_LongOnlyOpen' ], help='List of strategies to compare.')
 
 
     args = parser.parse_args()
 
-    starting_balance = 100000
+    starting_balance = 10000
     general_utils.set_seeds()
 
     if args.mode == 'trade':

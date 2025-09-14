@@ -12,7 +12,7 @@ class IterativeTuner:
         self.train_df = train_df
         self.validation_df = validation_df
         self.policy_kwargs = policy_kwargs
-        self.env_class = env_class  # Store the environment class
+        self.env_class = env_class
         self.logger = logging.getLogger(__name__)
 
     def objective(self, trial):
@@ -21,13 +21,16 @@ class IterativeTuner:
         gamma = trial.suggest_float('gamma', 0.9, 0.9999, log=True)
         learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-3, log=True)
         ent_coef = trial.suggest_float('ent_coef', 0.00000001, 0.1, log=True)
+        
+        window_size = trial.suggest_categorical('window_size', [10,15,20])
+        total_timesteps = trial.suggest_categorical('total_timesteps', [10000])
 
-        # Environment setup using the provided env_class
+        # Environment setup using the tuned window_size
         def make_train_env():
-            return self.env_class(self.train_df, self.feature_cols, window_size=10)
+            return self.env_class(self.train_df, self.feature_cols, window_size=window_size)
         
         def make_validation_env():
-            return self.env_class(self.validation_df, self.feature_cols, window_size=10)
+            return self.env_class(self.validation_df, self.feature_cols, window_size=window_size)
 
         train_env = make_vec_env(make_train_env, n_envs=4, seed=42)
         validation_env = make_validation_env()
@@ -45,8 +48,8 @@ class IterativeTuner:
             seed=42
         )
 
-        # Train and evaluate
-        model.learn(total_timesteps=10000)
+        # Train and evaluate using the tuned total_timesteps
+        model.learn(total_timesteps=total_timesteps)
         mean_reward, _ = evaluate_policy(model, validation_env, n_eval_episodes=10)
 
         self.logger.info(f"Trial {trial.number} finished with mean reward: {mean_reward}")
