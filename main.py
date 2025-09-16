@@ -1,7 +1,7 @@
 import yfinance as yf
 from sklearn.preprocessing import StandardScaler
 import pandas as pd
-from utils import general_utils, fetchers, features
+from utils import general_utils, fetchers, features, db_utils 
 from learners import CustomCNN, CustomLSTM
 from trading_envs import long_only_day_open, long_only_stock_env, long_short_stock_env
 import os
@@ -20,7 +20,6 @@ class PortfolioTrader:
         self.balance_per_ticker = starting_balance / len(tickers)
         self.portfolio_net_worth = None
         self.strategy = strategy
-
     def run(self):
         all_net_worths = {}
 
@@ -28,24 +27,31 @@ class PortfolioTrader:
             print(f"--- Processing Ticker: {ticker} ---")
             
             # 1. Data Fetching and Preprocessing
-            train_df, validation_df, test_df, feature_cols = self.prepare_data(ticker)
+            train_df, validation_df, test_df, all_feature_cols = self.prepare_data(ticker)
 
             # 2. Model Training and Tuning
             policy_kwargs = dict(
                 features_extractor_class=self.strategy['learner'],
                 features_extractor_kwargs=dict(features_dim=128),
             )
-            
-            study_name = f"parallel_iterative_study_{ticker}_{self.strategy['name']}"
-            db_file_path = os.path.join("db", f"{study_name}.db")
-            storage_name = f"sqlite:///{db_file_path}"
-            num_workers = 4
 
-            general_utils.run_parallel_tuning(study_name, storage_name, num_workers, feature_cols, train_df, validation_df, policy_kwargs, self.strategy['env'])
-            best_args = general_utils.get_best_args(study_name, storage_name)
+            best_features, best_args = db_utils.load_strategy(ticker, self.strategy['name'])
+
+            if best_features is None or best_args is None:
+                print("No optimal strategy found in DB. Running hyperparameter tuning...")
+                study_name = f"parallel_iterative_study_{ticker}_{self.strategy['name']}"
+                db_file_path = os.path.join("db", f"{study_name}.db")
+                storage_name = f"sqlite:///{db_file_path}"
+                num_workers = 4 # Or from args
+
+                # Use all features for the initial tuning run
+                general_utils.run_parallel_tuning(study_name, storage_name, num_workers, all_feature_cols, train_df, validation_df, policy_kwargs, self.strategy['env'])
+                best_args = general_utils.get_best_args(study_name, storage_name)
+                best_features = all_feature_cols
+            
             
             # 3. Backtesting
-            agent_net_worth, buy_hold_net_worth = general_utils.train_model(train_df, test_df, feature_cols, policy_kwargs, best_args, self.balance_per_ticker, self.strategy['env'])
+            agent_net_worth, buy_hold_net_worth = general_utils.train_model(train_df, test_df, best_features, policy_kwargs, best_args, self.balance_per_ticker, self.strategy['env'])
             
             all_net_worths[ticker] = {
                 'agent': agent_net_worth,
@@ -85,7 +91,7 @@ class PortfolioTrader:
         df_full = df_full.merge(spy_df_full['market_regime'], left_index=True, right_index=True, how='left')
         df_full = df_full.merge(vix_df_full['vix_risk_on'], left_index=True, right_index=True, how='left')
         df_full = df_full.merge(sentiment_df_full['normalized'], left_index=True, right_index=True, how='left')
-        df_full['normalized'] = df_full['normalized'].shift(1)
+        df_full['normalized'] = df_full['normalized']
         df_full[['market_regime', 'vix_risk_on', 'normalized']] = df_full[['market_regime', 'vix_risk_on', 'normalized']].ffill()
 
         train_df = df_full[df_full.index < train_end_date].copy()
@@ -212,9 +218,10 @@ STRATEGIES = {
 def main():
     general_utils.set_seeds(42)
     parser = argparse.ArgumentParser(description='ML Trader.')
-    parser.add_argument('--mode', type=str, default='trade', choices=['trade', 'find_best', 'compare'], help='Operation mode.')
-    parser.add_argument('--tickers', nargs='+', default=['TSLA'], help='List of stock tickers.')
-    parser.add_argument('--strategy', type=str, default='CNN_LongOnlyOpen', choices=STRATEGIES.keys(), help='Trading strategy to use.')
+    # Add 'feature_importance' to choices
+    parser.add_argument('--mode', type=str, default='find_optimal_strategy', choices=['trade', 'find_best', 'compare', 'feature_importance', 'rfe', 'find_optimal_strategy'], help='Operation mode.')
+    parser.add_argument('--tickers', nargs='+', default=['AAPL'], help='List of stock tickers.')
+    parser.add_argument('--strategy', type=str, default='CNN_LongOnly', choices=STRATEGIES.keys(), help='Trading strategy to use.')
     parser.add_argument('--compare_strategies', nargs='+', default=[ 'LSTM_LongOnly','CNN_LongOnly', 'LSTM_LongOnlyOpen','CNN_LongOnlyOpen' ], help='List of strategies to compare.')
 
 
@@ -235,6 +242,94 @@ def main():
         if len(args.tickers) > 1:
             print("Warning: 'compare' mode works with a single ticker. Using the first ticker provided.")
         compare_strategies(args.tickers[0], args.compare_strategies)
+    # New mode for feature importance
+    elif args.mode == 'feature_importance':
+        if len(args.tickers) > 1:
+            print("Warning: 'feature_importance' mode works with a single ticker. Using the first ticker provided.")
+        
+        ticker = args.tickers[0]
+        strategy = {'name': args.strategy, **STRATEGIES[args.strategy]}
+        trader = PortfolioTrader([ticker], starting_balance, strategy)
+
+        train_df, _, test_df, feature_cols = trader.prepare_data(ticker)
+        policy_kwargs = dict(
+            features_extractor_class=strategy['learner'],
+            features_extractor_kwargs=dict(features_dim=128),
+        )
+        
+        # You can use pre-tuned best_args or an empty dict for default parameters
+        study_name = f"parallel_iterative_study_{ticker}_{strategy['name']}"
+        db_file_path = os.path.join("db", f"{study_name}.db")
+        storage_name = f"sqlite:///{db_file_path}"
+        best_args = general_utils.get_best_args(study_name, storage_name)
+        
+        importances = general_utils.calculate_feature_importance(train_df, test_df, feature_cols, policy_kwargs, best_args, trader.balance_per_ticker, strategy['env'])
+        
+        # --- Reporting Results ---
+        print("\n--- Feature Importance Results ---")
+        sorted_importances = sorted(importances.items(), key=lambda item: item[1], reverse=True)
+        for feature, importance in sorted_importances:
+            print(f"{feature}: ${importance:,.2f}")
+
+        # Optional: Plotting
+        plt.figure(figsize=(10, 6))
+        plt.barh([item[0] for item in sorted_importances], [item[1] for item in sorted_importances])
+        plt.xlabel('Importance (Drop in Net Worth)')
+        plt.ylabel('Feature')
+        plt.title('Feature Importance')
+        plt.gca().invert_yaxis()
+        plt.show()
+    
+    elif args.mode == 'rfe':
+        if len(args.tickers) > 1:
+            print("Warning: 'rfe' mode works with a single ticker. Using the first ticker provided.")
+        
+        ticker = args.tickers[0]
+        strategy = {'name': args.strategy, **STRATEGIES[args.strategy]}
+        trader = PortfolioTrader([ticker], starting_balance, strategy)
+
+        train_df, validation_df , test_df, feature_cols = trader.prepare_data(ticker)
+        policy_kwargs = dict(
+            features_extractor_class=strategy['learner'],
+            features_extractor_kwargs=dict(features_dim=128),
+        )
+        
+        study_name = f"parallel_iterative_study_{ticker}_{strategy['name']}"
+        db_file_path = os.path.join("db", f"{study_name}.db")
+        storage_name = f"sqlite:///{db_file_path}"
+        best_args = general_utils.get_best_args(study_name, storage_name)
+        
+        ranked_features = general_utils.perform_rfe(train_df, validation_df, feature_cols, policy_kwargs, best_args, starting_balance, strategy['env'])
+        
+        print("\n--- Recursive Feature Elimination Ranking ---")
+        print("(From most to least important)")
+        for i, feature in enumerate(ranked_features):
+            print(f"{i+1}. {feature}")
+    
+    elif args.mode == 'find_optimal_strategy':
+        if len(args.tickers) > 1:
+            print("Warning: 'find_optimal_strategy' mode works with a single ticker. Using the first ticker provided.")
+        
+        ticker = args.tickers[0]
+        strategy = {'name': args.strategy, **STRATEGIES[args.strategy]}
+        trader = PortfolioTrader([ticker], starting_balance, strategy)
+
+        train_df, validation_df, test_df, feature_cols = trader.prepare_data(ticker)
+        policy_kwargs = dict(
+            features_extractor_class=strategy['learner'],
+            features_extractor_kwargs=dict(features_dim=128),
+        )
+        
+        best_features, best_params, best_worth = general_utils.find_optimal_features_and_params(
+            train_df, validation_df, test_df, feature_cols, policy_kwargs, starting_balance, strategy['env'], ticker, strategy['name'], 4
+        )
+        
+        print("\n--- Optimal Strategy Found ---")
+        print(f"Best Final Net Worth: ${best_worth:,.2f}")
+        print("Best Feature Set:", best_features)
+        print("Best Hyperparameters:", best_params)
+
+        db_utils.save_strategy(ticker, args.strategy, best_features, best_params, best_worth)
 
 
 if __name__ == "__main__":

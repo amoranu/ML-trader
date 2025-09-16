@@ -2,6 +2,7 @@
 
 import random
 import optuna
+import os
 import torch
 import numpy as np
 import logging
@@ -9,6 +10,7 @@ import logging.handlers
 import multiprocessing
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
+from yfinance import ticker
 
 def set_seeds(seed_value=42):
     random.seed(seed_value)
@@ -156,3 +158,149 @@ def train_model(train_df, test_df, feature_cols, policy_kwargs, best_args, initi
         print("❌ Agent did not outperform Buy and Hold.")
         
     return agent_net_worth, buy_hold_net_worth
+
+def calculate_feature_importance(train_df, test_df, feature_cols, policy_kwargs, best_args, initial_balance=10000, env_class=None):
+    """
+    Trains a model and calculates feature importance using permutation.
+    """
+    device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    window_size = best_args.get('window_size', 10)
+    total_timesteps = best_args.get('total_timesteps', 10000)
+
+    def make_env():
+        return env_class(train_df, feature_cols, window_size=window_size, initial_balance=initial_balance)
+
+    vec_env = make_vec_env(make_env, n_envs=4, seed=42)
+
+    model = PPO(
+        "MlpPolicy",
+        vec_env,
+        policy_kwargs=policy_kwargs,
+        n_steps=best_args.get('n_steps', 2048),
+        gamma=best_args.get('gamma', 0.99),
+        learning_rate=best_args.get('learning_rate', 0.0003),
+        ent_coef=best_args.get('ent_coef', 0.01),
+        verbose=0,
+        device=device,
+        seed=42
+    )
+
+    print(f"\n--- Starting Model Training for Feature Importance ({total_timesteps} timesteps) ---")
+    model.learn(total_timesteps=total_timesteps)
+    print("--- Model Training Finished ---")
+
+    # --- Baseline Performance ---
+    print("\n--- Calculating Baseline Performance ---")
+    backtest_env = env_class(test_df, feature_cols, window_size=window_size, initial_balance=initial_balance)
+    obs, info = backtest_env.reset(seed=42)
+    while True:
+        action, _ = model.predict(obs, deterministic=True)
+        obs, reward, terminated, truncated, info = backtest_env.step(action)
+        if terminated or truncated:
+            break
+    baseline_net_worth = info['net_worth']
+    print(f"Baseline Net Worth: ${baseline_net_worth:,.2f}")
+
+    # --- Permutation Feature Importance ---
+    importances = {}
+    print("\n--- Calculating Feature Importance ---")
+    for feature in feature_cols:
+        print(f"  Shuffling feature: {feature}")
+        permuted_test_df = test_df.copy()
+        permuted_test_df[feature] = np.random.permutation(permuted_test_df[feature])
+
+        backtest_env = env_class(permuted_test_df, feature_cols, window_size=window_size, initial_balance=initial_balance)
+        obs, info = backtest_env.reset(seed=42)
+
+        while True:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, terminated, truncated, info = backtest_env.step(action)
+            if terminated or truncated:
+                break
+        
+        permuted_net_worth = info['net_worth']
+        importance = baseline_net_worth - permuted_net_worth
+        importances[feature] = importance
+        print(f"    Net Worth with shuffled {feature}: ${permuted_net_worth:,.2f}, Importance: ${importance:,.2f}")
+
+    return importances
+
+def perform_rfe(train_df, validation_df, feature_cols, policy_kwargs, best_args, initial_balance=10000, env_class=None, num_features_to_keep=1):
+    """
+    Performs recursive feature elimination to find the best features.
+    """
+    device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    elimination_order = []
+    remaining_features = feature_cols.copy()
+
+    while len(remaining_features) > num_features_to_keep:
+        print(f"\n--- Starting RFE round with {len(remaining_features)} features ---")
+        
+        # Train the model with the current set of features
+        importances = calculate_feature_importance(
+            train_df, 
+            validation_df, 
+            remaining_features,  # Use the current subset of features
+            policy_kwargs, 
+            best_args, 
+            initial_balance, 
+            env_class
+        )
+        
+        if not importances:
+            print("Could not calculate importances. Stopping RFE.")
+            break
+
+        # Find the least important feature
+        least_important_feature = min(importances, key=importances.get)
+        elimination_order.append(least_important_feature)
+        remaining_features.remove(least_important_feature)
+        
+        print(f"--- Eliminated '{least_important_feature}' ---")
+
+    elimination_order.extend(remaining_features)
+    elimination_order.reverse()  # The last remaining are the most important
+
+    return elimination_order
+
+def find_optimal_features_and_params(train_df, validation_df, test_df, feature_cols, policy_kwargs, initial_balance, env_class, ticker, strategy_name, num_workers):
+    """
+    Finds the best set of features and hyperparameters by iteratively adding features based on RFE ranking.
+    """
+    print("--- Starting Feature Ranking with RFE ---")
+    ranked_features = perform_rfe(train_df, validation_df, feature_cols, policy_kwargs, {}, initial_balance, env_class)
+    print("\n--- RFE Feature Ranking Complete ---")
+    print("Ranked features (most to least important):", ranked_features)
+
+    best_net_worth = -1
+    best_feature_set = None
+    best_hyperparameters = None
+
+    for i in range(1, len(ranked_features) + 1):
+        current_features = ranked_features[:i]
+        print(f"\n--- Testing with Top {i} Features: {current_features} ---")
+
+        # --- Hyperparameter Tuning for the current feature set ---
+        study_name = f"tuning_with_{i}_features_{ticker}_{strategy_name}"
+        db_file_path = os.path.join("db", f"{study_name}.db")
+        storage_name = f"sqlite:///{db_file_path}"
+
+        run_parallel_tuning(study_name, storage_name, num_workers, current_features, train_df, validation_df, policy_kwargs, env_class)
+        current_best_args = get_best_args(study_name, storage_name)
+
+        # --- Backtesting with the best args for the current feature set ---
+        agent_net_worth, _ = train_model(train_df, test_df, current_features, policy_kwargs, current_best_args, initial_balance, env_class)
+        final_net_worth = agent_net_worth[-1]
+
+        print(f"--- Result for Top {i} Features: Final Net Worth = ${final_net_worth:,.2f} ---")
+
+        if final_net_worth > best_net_worth:
+            best_net_worth = final_net_worth
+            best_feature_set = current_features
+            best_hyperparameters = current_best_args
+
+    return best_feature_set, best_hyperparameters, best_net_worth
